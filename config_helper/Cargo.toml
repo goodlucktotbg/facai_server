@@ -1,0 +1,13 @@
+[package]
+name = "config_helper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# common.workspace = true
+rust_utils.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+config.workspace = true
+once_cell.workspace = true

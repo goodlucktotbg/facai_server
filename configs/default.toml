@@ -1,0 +1,11 @@
+
+[log]
+level = "info"
+dir = "./log"
+file = "log"
+
+[main_database]
+url = "mysql://root:54168ccC@localhost:3306/facai"
+min_connections = 10
+max_connections = 500
+connect_timeout = 3000

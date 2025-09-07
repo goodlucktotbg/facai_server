@@ -1,0 +1,12 @@
+[package]
+name = "database"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+config_helper.workspace = true
+sea-orm.workspace = true
+once_cell.workspace = true
+parking_lot.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
