@@ -11,6 +11,13 @@ pub struct Config {
     pub log: LogConfig,
     // pub auth: AuthConfig,
     pub main_database: DatabaseConfig,
+    pub tron: TronConfig,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct TronConfig {
+    pub full_host: String,
+    pub usdt_contract: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]

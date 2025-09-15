@@ -1,7 +1,10 @@
 use kameo::{Actor, mailbox::unbounded};
 use thiserror::Error;
 
-use crate::data_cache_manager::DataCacheManager;
+use crate::{
+    data_cache_manager::DataCacheManager, telegram_bot::telegram_bot_manager::TelegramBotManager,
+    tron::tron_manager::TronManager,
+};
 
 #[derive(Debug, Error, Clone)]
 pub enum ApplicationError {
@@ -35,6 +38,16 @@ impl Actor for Application {
                     "DataCacheManager".to_string(),
                     format!("{e:?}"),
                 )
+            })?;
+
+        TronManager::spawn_link(&actor_ref).await.map_err(|e| {
+            ApplicationError::StartServiceError("Tron Manager".to_string(), format!("{e:?}"))
+        })?;
+
+        TelegramBotManager::spawn_link(&actor_ref)
+            .await
+            .map_err(|e| {
+                ApplicationError::StartServiceError("Telegram Bot".to_string(), format!("{e:?}"))
             })?;
 
         Ok(args)

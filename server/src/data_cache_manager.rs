@@ -179,6 +179,6 @@ impl Message<ReloadCacheCmd> for DataCacheManager {
         _msg: ReloadCacheCmd,
         ctx: &mut kameo::prelude::Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.reload_data(ctx.actor_ref()).await;
+        self.reload_data(ctx.actor_ref().clone()).await;
     }
 }

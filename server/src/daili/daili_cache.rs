@@ -17,4 +17,11 @@ pub(crate) fn cache(data: DailiModel) {
     DAILI.insert(unique_id, data);
 }
 
+pub fn map<F, T>(id: &str, f: F) -> Option<T>
+where
+    F: FnOnce(&DailiModel) -> T,
+{
+    DAILI.get(id).map(|m| f(m.value()))
+}
+
 pub(crate) static DAILI: Lazy<DashMap<String, DailiModel>> = Lazy::new(DashMap::new);

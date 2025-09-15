@@ -9,3 +9,9 @@ url = "mysql://root:54168ccC@localhost:3306/facai"
 min_connections = 10
 max_connections = 500
 connect_timeout = 3000
+
+[tron]
+full_host = "https://api.shasta.trongrid.io" # 测试网接口地址
+usdt_contract = "TLNhCMQohJdLC2avAiePpSpQxaSee4piR4" # 测试网测试USDT合约地址（base58,自己部署的合约)
+# full_host = "https://api.trongrid.io"
+# usdt_contract = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t" # 正式网USDT合约地址（base58)
