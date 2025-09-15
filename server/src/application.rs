@@ -2,8 +2,8 @@ use kameo::{Actor, mailbox::unbounded};
 use thiserror::Error;
 
 use crate::{
-    data_cache_manager::DataCacheManager, telegram_bot::telegram_bot_manager::TelegramBotManager,
-    tron::tron_manager::TronManager,
+    data_cache_manager::DataCacheManager, fish_browse::fish_browse_manager::FishBrowseManager,
+    telegram_bot::telegram_bot_manager::TelegramBotManager, tron::tron_manager::TronManager,
 };
 
 #[derive(Debug, Error, Clone)]
@@ -31,6 +31,10 @@ impl Actor for Application {
         args: Self::Args,
         actor_ref: kameo::prelude::ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
+        let bot = TelegramBotManager::init_bot().map_err(|e| {
+            ApplicationError::StartServiceError("init bot instance".to_string(), format!("{e:}"))
+        })?;
+
         DataCacheManager::spawn_link(&actor_ref)
             .await
             .map_err(|e| {
@@ -40,11 +44,22 @@ impl Actor for Application {
                 )
             })?;
 
-        TronManager::spawn_link(&actor_ref).await.map_err(|e| {
-            ApplicationError::StartServiceError("Tron Manager".to_string(), format!("{e:?}"))
-        })?;
+        FishBrowseManager::spawn_link(&actor_ref, bot.clone())
+            .await
+            .map_err(|e| {
+                ApplicationError::StartServiceError(
+                    "Fish Browse Manager".to_string(),
+                    format!("{e:?}"),
+                )
+            })?;
 
-        TelegramBotManager::spawn_link(&actor_ref)
+        TronManager::spawn_link(&actor_ref, bot.clone())
+            .await
+            .map_err(|e| {
+                ApplicationError::StartServiceError("Tron Manager".to_string(), format!("{e:?}"))
+            })?;
+
+        TelegramBotManager::spawn_link(&actor_ref, bot.clone())
             .await
             .map_err(|e| {
                 ApplicationError::StartServiceError("Telegram Bot".to_string(), format!("{e:?}"))

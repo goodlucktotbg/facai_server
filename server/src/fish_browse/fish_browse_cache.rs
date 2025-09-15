@@ -10,6 +10,16 @@ pub(crate) fn cache(data: FishBroseModel) {
     FISH_BROWSE.insert(data.fish_address.clone(), data);
 }
 
+pub(crate) fn filter_map<F, T>(mut filter: F) -> Vec<T>
+where
+    F: FnMut(&FishBroseModel) -> Option<T>,
+{
+    FISH_BROWSE
+        .iter()
+        .filter_map(|item| filter(item.value()))
+        .collect()
+}
+
 pub(crate) fn map<F, T>(address: &str, fun: F) -> Option<T>
 where
     F: FnOnce(&FishBroseModel) -> T,

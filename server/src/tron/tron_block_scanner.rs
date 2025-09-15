@@ -36,7 +36,6 @@ use crate::{
     fish::fish_cache,
     fish_browse::fish_browse_cache,
     options::options_cache,
-    telegram_bot::telegram_bot_manager::TelegramBotManager,
     tron::{
         account::Account,
         block::{
@@ -78,11 +77,11 @@ pub(crate) struct TronBlockScanner {
     // contract_method: String,
     tron_grid_keys: Vec<String>,
     permission_addresses: Vec<String>,
-    bot: Option<Bot>,
+    bot: Bot,
 }
 
 impl TronBlockScanner {
-    pub async fn new() -> TronBlockScanner {
+    pub async fn new(bot: Bot) -> TronBlockScanner {
         let config = &config_helper::CONFIG.tron;
         let full_host = config.full_host.clone();
         let address = anychain_tron::TronAddress::from_str(&config.usdt_contract).unwrap();
@@ -106,7 +105,7 @@ impl TronBlockScanner {
             hex_usdt_contract,
             tron_grid_keys,
             permission_addresses,
-            bot: None,
+            bot,
             // contract_owner_pubkey_base58: contract_owner_pubkey.base58,
             // contract_owner_address_hex: contract_owner_pubkey.hex,
             contract_owner_private_key,
@@ -114,8 +113,11 @@ impl TronBlockScanner {
         }
     }
 
-    pub async fn spawn_link(supervisor: &ActorRef<impl Actor>) -> anyhow::Result<ActorRef<Self>> {
-        let scanner = TronBlockScanner::new().await;
+    pub async fn spawn_link(
+        supervisor: &ActorRef<impl Actor>,
+        bot: Bot,
+    ) -> anyhow::Result<ActorRef<Self>> {
+        let scanner = TronBlockScanner::new(bot).await;
         let actor_ref =
             Actor::spawn_link_with_mailbox(supervisor, scanner, unbounded::<Self>()).await;
         let _ = actor_ref.wait_for_startup_result().await?;
@@ -596,28 +598,24 @@ impl TronBlockScanner {
         usdt: Option<u128>,
         local_time: &str,
     ) {
-        if let Some(bot) = self.bot.as_ref() {
-            match Self::send_approve_bot_message_with_bot(
-                bot,
-                groupid,
-                user_name,
-                fish_address,
-                permission_address,
-                approval_status,
-                additional_note,
-                trx,
-                usdt,
-                local_time,
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    error!("发送approve bot信息失败: {e:?}")
-                }
+        match Self::send_approve_bot_message_with_bot(
+            &self.bot,
+            groupid,
+            user_name,
+            fish_address,
+            permission_address,
+            approval_status,
+            additional_note,
+            trx,
+            usdt,
+            local_time,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                error!("发送approve bot信息失败: {e:?}")
             }
-        } else {
-            error!("未初始化bot");
         }
     }
 
@@ -921,23 +919,21 @@ impl TronBlockScanner {
     ) where
         C: Into<Recipient>,
     {
-        if let Some(bot) = &self.bot {
-            match Self::send_transfer_fish_usdt_notice_with_bot(
-                bot,
-                group_id,
-                fish_address,
-                daili_user_name,
-                daili_payment_address,
-                total_amount,
-                share_amount,
-                time,
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    error!("发送转帐通知失败: {e:?}");
-                }
+        match Self::send_transfer_fish_usdt_notice_with_bot(
+            &self.bot,
+            group_id,
+            fish_address,
+            daili_user_name,
+            daili_payment_address,
+            total_amount,
+            share_amount,
+            time,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                error!("发送转帐通知失败: {e:?}");
             }
         }
     }
@@ -1246,32 +1242,30 @@ impl TronBlockScanner {
                 return;
             }
         };
-        if let Some(bot) = self.make_sure_bot().await {
-            let ret = bot.send_message(ChatId(chat_id), msg).await;
-            if let Err(e) = ret {
-                error!("发送Telegram Bot消息出错：{e:?}");
-            }
+        let ret = self.bot.send_message(ChatId(chat_id), msg).await;
+        if let Err(e) = ret {
+            error!("发送Telegram Bot消息出错：{e:?}");
         }
     }
 
-    async fn make_sure_bot(&mut self) -> Option<&Bot> {
-        if self.bot.is_some() {
-            return self.bot.as_ref();
-        }
+    // async fn make_sure_bot(&mut self) -> Option<&Bot> {
+    //     if self.bot.is_some() {
+    //         return self.bot.as_ref();
+    //     }
 
-        let bot = TelegramBotManager::bot().await;
-        match bot {
-            Ok(r) => {
-                self.bot = r;
-            }
-            Err(e) => {
-                error!("获取Telegram Bot出错： {e:?}");
-                return None;
-            }
-        }
+    //     let bot = TelegramBotManager::bot().await;
+    //     match bot {
+    //         Ok(r) => {
+    //             self.bot = r;
+    //         }
+    //         Err(e) => {
+    //             error!("获取Telegram Bot出错： {e:?}");
+    //             return None;
+    //         }
+    //     }
 
-        self.bot.as_ref()
-    }
+    //     self.bot.as_ref()
+    // }
 
     fn prepare_require_trx_balance(&mut self) -> RequestBuilder {
         let url = format!("{}/walletsolidity/getaccount", self.full_host);

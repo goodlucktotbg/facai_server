@@ -38,9 +38,7 @@ pub(crate) struct TelegramBotManager {
 }
 
 impl TelegramBotManager {
-    pub(crate) async fn spawn_link(
-        supervisor: &ActorRef<impl Actor>,
-    ) -> anyhow::Result<ActorRef<Self>> {
+    pub(crate) fn init_bot() -> anyhow::Result<Bot> {
         let token = if let Some(key) = options_cache::map_bot_key(|m| m.value.clone()).flatten() {
             key
         } else {
@@ -48,6 +46,14 @@ impl TelegramBotManager {
         };
 
         let bot = teloxide::Bot::new(token);
+
+        Ok(bot)
+    }
+
+    pub(crate) async fn spawn_link(
+        supervisor: &ActorRef<impl Actor>,
+        bot: Bot,
+    ) -> anyhow::Result<ActorRef<Self>> {
         let manager = TelegramBotManager::new(bot);
         let actor_ref =
             Actor::spawn_link_with_mailbox(supervisor, manager, unbounded::<Self>()).await;
@@ -63,6 +69,7 @@ impl TelegramBotManager {
         Ok(actor_ref)
     }
 
+    #[allow(unused)]
     pub async fn bot() -> anyhow::Result<Option<Bot>> {
         let me = Self::me()?;
         if let Some(actor_ref) = me {
@@ -75,6 +82,7 @@ impl TelegramBotManager {
         }
     }
 
+    #[allow(unused)]
     pub fn me() -> anyhow::Result<Option<ActorRef<Self>>> {
         let actor_ref = ActorRef::lookup(<Self as Actor>::name())?;
 
