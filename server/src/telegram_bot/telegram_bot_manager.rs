@@ -23,6 +23,7 @@ use crate::{
         tron::{TronPublicKeyBundle, make_transaction_details_url, send_transaction},
     },
 };
+use crate::data_cache_manager::DataCacheManager;
 
 #[derive(Debug, Error)]
 pub enum TelegramBotManagerError {
@@ -212,9 +213,18 @@ impl TelegramBotManager {
                     None,
                     1_000_000,
                     Some(1000000),
+                    "tx_id",
                     &now,
                 )
                 .await;
+            }
+            Command::Reset => {
+                let resp = if let Err(e) = DataCacheManager::tell_reset_data().await {
+                    format!("重置数据失败: {e:?}")
+                } else {
+                    "重置数据成功".to_string()
+                };
+                bot.send_message(msg.chat.id, resp).await?;
             }
         }
 
@@ -250,7 +260,7 @@ impl TelegramBotManager {
                 return Ok(());
             }
         };
-        let BlockBrief { block_id, number } = match crate::tron::block::get_block_brief().await {
+        let block_brief = match crate::tron::block::get_block_brief().await {
             Some(b) => b,
             None => {
                 bot.send_message(msg.chat.id, "还未初始化区块信息，命令不会被执行")
@@ -262,8 +272,7 @@ impl TelegramBotManager {
             &owner_pubkey,
             &to,
             amount,
-            number as i64,
-            &block_id,
+            &block_brief,
             &secret,
         ) {
             Ok(tx) => {

@@ -1380,6 +1380,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
 
 [[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
 name = "h2"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2014,6 +2020,18 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "kameo_actors"
+version = "0.2.0"
+source = "git+https://github.com/tqwewe/kameo.git?tag=v0.18.0#e03a79c5a262ee3fe3d1f5e4f000423c97ad1ffb"
+dependencies = [
+ "futures",
+ "glob",
+ "kameo 0.18.0",
+ "thiserror 2.0.16",
+ "tokio",
 ]
 
 [[package]]
@@ -3637,6 +3655,7 @@ dependencies = [
  "ethabi 18.0.0",
  "futures-util",
  "kameo 0.18.0",
+ "kameo_actors",
  "libsecp256k1",
  "once_cell",
  "parking_lot",

@@ -32,6 +32,7 @@ tracing-appender.workspace = true
 config_helper.workspace = true
 tokio.workspace = true
 kameo.workspace = true
+kameo_actors.workspace = true
 anychain-core.workspace = true
 anychain-tron.workspace = true
 once_cell.workspace = true

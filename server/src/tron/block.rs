@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 pub struct BlockBrief {
     pub block_id: String,
     pub number: u64,
+    pub timestamp: u64,
 }
 
 /// 当前区块
@@ -15,8 +16,9 @@ pub static CURRENT_BLOCK: Lazy<RwLock<Option<BlockBrief>>> = Lazy::new(|| RwLock
 pub async fn update_block_brief(block: &Block) {
     let block_id = block.block_id.clone();
     let number = block.block_header.raw_data.number;
+    let timestamp = block.block_header.raw_data.timestamp;
     let mut write = CURRENT_BLOCK.write().await;
-    write.replace(BlockBrief { block_id, number });
+    write.replace(BlockBrief { block_id, number, timestamp });
 }
 
 pub async fn get_block_brief() -> Option<BlockBrief> {
@@ -120,6 +122,8 @@ pub enum ContractRet {
     #[serde(rename = "OUT_OF_ENERGY")]
     OutOfEnergy,
     FAIL,
+    FAILED,
+    REVERT,
 }
 
 #[derive(Serialize, Deserialize)]

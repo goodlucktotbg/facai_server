@@ -14,6 +14,7 @@ pub(crate) mod options;
 pub(crate) mod telegram_bot;
 pub(crate) mod tron;
 pub mod utils;
+pub mod bus;
 
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {

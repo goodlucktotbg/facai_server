@@ -1,6 +1,7 @@
 use kameo::{Actor, mailbox::unbounded};
 use thiserror::Error;
 
+use crate::bus::event::event_manager::EventManager;
 use crate::{
     data_cache_manager::DataCacheManager, fish_browse::fish_browse_manager::FishBrowseManager,
     telegram_bot::telegram_bot_manager::TelegramBotManager, tron::tron_manager::TronManager,
@@ -31,11 +32,18 @@ impl Actor for Application {
         args: Self::Args,
         actor_ref: kameo::prelude::ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
-        let bot = TelegramBotManager::init_bot().map_err(|e| {
-            ApplicationError::StartServiceError("init bot instance".to_string(), format!("{e:}"))
+        EventManager::spawn_link(&actor_ref).await.map_err(|e| {
+            ApplicationError::StartServiceError("bus".to_string(), format!("{e:?}"))
         })?;
 
-        DataCacheManager::spawn_link(&actor_ref)
+        let event_manager = EventManager::actor_ref()
+            .await
+            .map_err(|e| ApplicationError::StartServiceError("bus".to_string(), format!("{e:?}")))?
+            .ok_or_else(|| {
+                ApplicationError::StartServiceError("bus".to_string(), "未注册".to_string())
+            })?;
+
+        DataCacheManager::spawn_link(&actor_ref, event_manager.clone())
             .await
             .map_err(|e| {
                 ApplicationError::StartServiceError(
@@ -43,6 +51,10 @@ impl Actor for Application {
                     format!("{e:?}"),
                 )
             })?;
+
+        let bot = TelegramBotManager::init_bot().map_err(|e| {
+            ApplicationError::StartServiceError("init bot instance".to_string(), format!("{e:}"))
+        })?;
 
         FishBrowseManager::spawn_link(&actor_ref, bot.clone())
             .await

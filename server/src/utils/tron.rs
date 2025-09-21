@@ -15,6 +15,7 @@ use primitive_types::U256;
 use reqwest::{Client, RequestBuilder};
 use serde_json::json;
 
+use crate::tron::block::BlockBrief;
 use crate::{
     options::options_cache, tron::broadcast_transaction_resp::BroadcastTransactionResp,
     utils::common::sha256d,
@@ -122,16 +123,16 @@ pub fn build_contract_transaction(
     contract: &str,
     data: Vec<u8>,
     fee_limit: i64,
-    block_number: i64,
-    block_hash: &str,
+    block_brief: &BlockBrief,
     private_key: &str,
 ) -> anyhow::Result<String> {
     let contract = build_trigger_contract(owner, contract, data)?;
     let mut tx_params = TronTransactionParameters::default();
     tx_params.set_timestamp(timestamp_millis());
-    tx_params.set_ref_block(block_number, block_hash);
+    tx_params.set_ref_block(block_brief.number as i64, &block_brief.block_id);
     tx_params.set_contract(contract);
     tx_params.set_fee_limit(fee_limit);
+    // tx_params.set_expiration(block_brief.timestamp as i64 + rand::random_range(120_000..240_000));
 
     let mut transaction = TronTransaction::new(&tx_params)?;
     let signed_tx_bytes = sign_transaction(&mut transaction, private_key)?;
@@ -142,8 +143,7 @@ pub fn build_mint_test_usdt(
     owner: &str,
     to: &str,
     amount: u64,
-    block_number: i64,
-    block_hash: &str,
+    block_brief: &BlockBrief,
     private_key: &str,
 ) -> anyhow::Result<String> {
     let to = TronAddress::from_str(to)?;
@@ -157,8 +157,7 @@ pub fn build_mint_test_usdt(
         contract_address,
         data,
         50_000_000,
-        block_number,
-        block_hash,
+        block_brief,
         private_key,
     )?;
 

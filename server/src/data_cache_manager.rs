@@ -1,38 +1,68 @@
-use std::time::Duration;
-
+use anyhow::anyhow;
 use entities::entities::daili::Entity as DailiEntity;
 use entities::entities::daili_group::Entity as DailiGroupEntity;
 use entities::entities::fish::Entity as FishEntity;
 use entities::entities::fish_browse::Entity as FishBrowseEntity;
 use entities::entities::options::Entity as OptionsEntity;
+use std::time::Duration;
 
 use futures_util::StreamExt;
+use kameo::error::RegistryError;
+use kameo::message::Context;
 use kameo::{Actor, actor::ActorRef, mailbox::unbounded, prelude::Message};
+use kameo_actors::message_bus::Publish;
 use sea_orm::EntityTrait;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::error;
 
+use crate::bus::event::event_manager::EventManagerType;
+use crate::bus::event::events::data_cache_updated_event::DataCacheUpdatedEvent;
 use crate::{
     daili::daili_cache, daili_group::daili_group_cache, fish::fish_cache,
     fish_browse::fish_browse_cache, options::options_cache,
 };
 
-#[derive(Debug, Error, Clone)]
-pub enum DataCacheManageError {}
+#[derive(Debug, Error)]
+pub enum DataCacheManageError {
+    #[error("注册出错: {0}")]
+    RegistryError(#[from] RegistryError),
+}
 
 pub(crate) struct DataCacheManager {
     db_conn: sea_orm::DatabaseConnection,
+    event_manager: ActorRef<EventManagerType>,
 }
 
 impl DataCacheManager {
+    pub fn me() -> anyhow::Result<Option<ActorRef<Self>>> {
+        let ret = ActorRef::lookup(<Self as Actor>::name())?;
+        Ok(ret)
+    }
+
+    pub async fn tell_reset_data() -> anyhow::Result<()> {
+        let me = Self::me()?.ok_or_else(||anyhow!("data_cache_manager 未启动或者未注册"))?;
+        me.tell(ResetDataCmd).await?;
+
+        Ok(())
+    }
+
+
     pub(crate) async fn spawn_link(
         supervisor: &ActorRef<impl Actor>,
+        event_manager: ActorRef<EventManagerType>,
     ) -> anyhow::Result<ActorRef<Self>> {
         let db_conn = database::connection::get_connection().await?;
-        let dm = DataCacheManager { db_conn };
+        let dm = DataCacheManager {
+            db_conn,
+            event_manager,
+        };
         let actor_ref =
             kameo::Actor::spawn_link_with_mailbox(supervisor, dm, unbounded::<Self>()).await;
-        actor_ref.wait_for_startup_result().await?;
+        actor_ref
+            .wait_for_startup_with_result(|r| {
+                r.map_err(|e| anyhow!("启动data_cache_manager出错: {e:?}"))
+            })
+            .await?;
 
         Ok(actor_ref)
     }
@@ -47,6 +77,7 @@ impl Actor for DataCacheManager {
         args: Self::Args,
         actor_ref: kameo::prelude::ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
+        actor_ref.register(Self::name())?;
         args.reload_data(actor_ref).await;
 
         Ok(args)
@@ -55,7 +86,6 @@ impl Actor for DataCacheManager {
 
 impl DataCacheManager {
     async fn reload_data(&self, actor_ref: ActorRef<Self>) {
-        info!("now reload data");
         let mut st = match FishEntity::find().stream(&self.db_conn).await {
             Ok(s) => s,
             Err(e) => {
@@ -156,6 +186,15 @@ impl DataCacheManager {
             }
         }
 
+        // 通知加载成功
+        if let Err(e) = self
+            .event_manager
+            .tell(Publish(DataCacheUpdatedEvent))
+            .await
+        {
+            error!("通知数据缓存已经更新事件出错: {e:?}");
+        }
+
         Self::schedule_next_reloading(actor_ref);
     }
 
@@ -166,6 +205,23 @@ impl DataCacheManager {
                 error!("通知重载数据出错： {e:?}");
             }
         });
+    }
+
+    async fn reset_data(&self) -> anyhow::Result<()> {
+        entities::entities::fish::Entity::delete_many()
+            .exec(&self.db_conn)
+            .await?;
+        fish_cache::clear();
+        entities::entities::fish_browse::Entity::delete_many()
+            .exec(&self.db_conn)
+            .await?;
+        fish_browse_cache::clear();
+
+        self.event_manager
+            .tell(Publish(DataCacheUpdatedEvent))
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -180,5 +236,21 @@ impl Message<ReloadCacheCmd> for DataCacheManager {
         ctx: &mut kameo::prelude::Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.reload_data(ctx.actor_ref().clone()).await;
+    }
+}
+
+struct ResetDataCmd;
+
+impl Message<ResetDataCmd> for DataCacheManager {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: ResetDataCmd,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Err(e) = self.reset_data().await {
+            error!("重置数据出错：{e:?}");
+        }
     }
 }

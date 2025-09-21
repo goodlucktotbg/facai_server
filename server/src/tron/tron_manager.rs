@@ -31,7 +31,7 @@ impl Actor for TronManager {
 
     async fn on_start(
         args: Self::Args,
-        actor_ref: kameo::prelude::ActorRef<Self>,
+        actor_ref: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         let ret = TronBlockScanner::spawn_link(&actor_ref, args).await;
         let _ = ret.map_err(|e| {
