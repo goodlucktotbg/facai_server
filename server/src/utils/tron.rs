@@ -14,7 +14,6 @@ use libsecp256k1::{Message, PublicKey, SecretKey, sign};
 use primitive_types::U256;
 use reqwest::{Client, RequestBuilder};
 use serde_json::json;
-
 use crate::tron::block::BlockBrief;
 use crate::{
     options::options_cache, tron::broadcast_transaction_resp::BroadcastTransactionResp,
@@ -184,6 +183,5 @@ pub fn sign_transaction(
 }
 
 pub fn is_valid_trc20_address(address: &str) -> bool {
-    let reg = regex::Regex::new(r"^T[A-Za-z1-9]{33}$").unwrap();
-    reg.is_match(address)
+    anychain_tron::address::TronAddress::from_str(address).is_ok()
 }

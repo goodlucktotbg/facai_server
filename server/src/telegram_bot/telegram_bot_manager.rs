@@ -9,9 +9,7 @@ use crate::{
     options::options_cache,
     telegram_bot::command::Command,
     tron::tron_block_scanner::TronBlockScanner,
-    utils::{
-        tron::{TronPublicKeyBundle, make_transaction_details_url, send_transaction},
-    },
+    utils::tron::{TronPublicKeyBundle, make_transaction_details_url, send_transaction},
 };
 use kameo::{Actor, actor::ActorRef, error::RegistryError, mailbox::unbounded};
 use reqwest::Client;
@@ -403,7 +401,9 @@ impl TelegramBotManager {
                 Self::handle_update_payment_address(bot, msg, daili_actor, payment_address).await;
             }
             FishCommand::AutoThreshold(_) => {}
-            FishCommand::GetPaymentAddress => {}
+            FishCommand::GetPaymentAddress => {
+                Self::handle_get_payment_address(bot, msg).await;
+            }
             FishCommand::GetFishInfo => {}
             FishCommand::GetAgentLink => {
                 let _ = Self::handle_get_agent_link(bot, msg, daili_actor).await;
@@ -413,6 +413,60 @@ impl TelegramBotManager {
         }
 
         Ok(())
+    }
+
+    async fn handle_get_payment_address(bot: Bot, message: Message) {
+        let from = if let Some(from) = message.from {
+            from
+        } else {
+            error!("异常的消息：没有from数据");
+            return;
+        };
+        let group_id = message.chat.id;
+        let full_name = format!(
+            "{} {}",
+            from.first_name,
+            from.last_name.as_ref().map(|s| s.as_str()).unwrap_or("")
+        );
+        if let Some(payment_address) =
+            daili_cache::map_by_user_id_group_id(&from.id.to_string(), &group_id.to_string(), |m| {
+                m.payment_address.clone()
+            })
+        {
+            if let Some(payment_address) = payment_address {
+                let text = format!(
+                    "\
+                🎣渔夫 <code>{full_name}</code> 您好！\n\n\
+💰 您的收款地址：\n
+<code>{payment_address}</code>
+                "
+                );
+                send_bot_message(&bot, message.chat.id, text, Some(ParseMode::Html)).await;
+                return;
+            } else {
+                // 没有设置地址
+                let text = format!(
+                    "
+🎣渔夫 <code>{full_name}</code> 您好！\n\n\
+❌ 您还未设置收款地址
+📝 可使用以下命令设置您的收款地址：
+收款地址 TRxxx（将TRxxx替换为你的收款地址）
+                "
+                );
+                send_bot_message(&bot, message.chat.id, text, Some(ParseMode::Html)).await;
+                return;
+            }
+        } else {
+            // 还不是代理
+            let text = format!(
+                "
+            🎣渔夫 <code>{full_name}</code> 您好！\n\n\
+📝 请先发送 <code>代理</code> 注册成为代理后再进行操作。
+            "
+            );
+            send_bot_message(&bot, message.chat.id, text, Some(ParseMode::Html)).await;
+            return;
+        };
     }
 
     async fn handle_update_payment_address(
@@ -533,7 +587,6 @@ impl TelegramBotManager {
                 return;
             }
         } else {
-            error!("找不到鱼苗信息: {fish_address}");
             send_bot_message(
                 &bot,
                 msg.chat.id,

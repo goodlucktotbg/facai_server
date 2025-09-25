@@ -106,14 +106,14 @@ impl FishCommand {
                 FishCommandFlag::Rules => FishCommand::Rules,
                 FishCommandFlag::Threshold => {
                     // 地址
-                    let address = if let Some(address) = &cap.get(0) {
+                    let address = if let Some(address) = &cap.get(1) {
                         address.as_str().to_string()
                     } else {
                         return Some(ParseFishCommandResult::Err(
                             "修改阈值必须要提供有效的地址".to_string(),
                         ));
                     };
-                    let value = if let Some(value) = &cap.get(1) {
+                    let value = if let Some(value) = &cap.get(2) {
                         match f64::from_str(value.as_str()) {
                             Ok(f) => f,
                             Err(_) => {
@@ -130,7 +130,7 @@ impl FishCommand {
                     FishCommand::Threshold(address, value)
                 }
                 FishCommandFlag::KillFish => {
-                    let address = if let Some(address) = &cap.get(0) {
+                    let address = if let Some(address) = &cap.get(1) {
                         address.as_str().to_string()
                     } else {
                         return Some(ParseFishCommandResult::Err(
@@ -140,7 +140,7 @@ impl FishCommand {
                     FishCommand::KillFish(address)
                 }
                 FishCommandFlag::PaymentAddress => {
-                    let address = if let Some(address) = &cap.get(0) {
+                    let address = if let Some(address) = &cap.get(1) {
                         address.as_str().to_string()
                     } else {
                         return Some(ParseFishCommandResult::Err(
@@ -150,7 +150,7 @@ impl FishCommand {
                     FishCommand::PaymentAddress(address)
                 }
                 FishCommandFlag::AutoThreshold => {
-                    let value = if let Some(value) = &cap.get(0) {
+                    let value = if let Some(value) = &cap.get(1) {
                         match f64::from_str(value.as_str()) {
                             Ok(f) => f,
                             Err(_) => {
@@ -170,7 +170,7 @@ impl FishCommand {
                 FishCommandFlag::GetFishInfo => FishCommand::GetFishInfo,
                 FishCommandFlag::GetAgentLink => FishCommand::GetAgentLink,
                 FishCommandFlag::AdminQueryFish => {
-                    let address = if let Some(address) = &cap.get(0) {
+                    let address = if let Some(address) = &cap.get(1) {
                         address.as_str().to_string()
                     } else {
                         return Some(ParseFishCommandResult::Err("请提供有效的地址".to_string()));
@@ -178,7 +178,7 @@ impl FishCommand {
                     FishCommand::AdminQueryFish(address)
                 }
                 FishCommandFlag::Payment => {
-                    let value = if let Some(value) = &cap.get(0) {
+                    let value = if let Some(value) = &cap.get(1) {
                         match f64::from_str(value.as_str()) {
                             Ok(f) => f,
                             Err(_) => {
