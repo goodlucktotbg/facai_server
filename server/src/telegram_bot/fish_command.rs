@@ -1,16 +1,10 @@
-use once_cell::sync::Lazy;
 use regex::Regex;
-use sea_orm::Iden;
-use std::num::ParseFloatError;
 use std::str::FromStr;
-use tracing::error;
 
 pub struct CommandPattern {
     command: FishCommandFlag,
     regex: Regex,
 }
-
-static PATTERNS: Lazy<Vec<CommandPattern>> = Lazy::new(init_patterns);
 
 pub fn init_patterns() -> Vec<CommandPattern> {
     vec![
@@ -82,7 +76,7 @@ pub enum FishCommand {
     Rules,
     Threshold(String, f64),
     KillFish(String),
-    PaymentAddress,
+    PaymentAddress(String),
     AutoThreshold(f64),
     GetPaymentAddress,
     GetFishInfo,
@@ -145,7 +139,16 @@ impl FishCommand {
                     };
                     FishCommand::KillFish(address)
                 }
-                FishCommandFlag::PaymentAddress => FishCommand::PaymentAddress,
+                FishCommandFlag::PaymentAddress => {
+                    let address = if let Some(address) = &cap.get(0) {
+                        address.as_str().to_string()
+                    } else {
+                        return Some(ParseFishCommandResult::Err(
+                            "修改付款地址必须要提供一个有效地址".to_string(),
+                        ));
+                    };
+                    FishCommand::PaymentAddress(address)
+                }
                 FishCommandFlag::AutoThreshold => {
                     let value = if let Some(value) = &cap.get(0) {
                         match f64::from_str(value.as_str()) {
@@ -163,22 +166,14 @@ impl FishCommand {
                     };
                     FishCommand::AutoThreshold(value)
                 }
-                FishCommandFlag::GetPaymentAddress => {
-                    FishCommand::GetPaymentAddress
-                }
-                FishCommandFlag::GetFishInfo => {
-                    FishCommand::GetFishInfo
-                }
-                FishCommandFlag::GetAgentLink => {
-                    FishCommand::GetAgentLink
-                }
+                FishCommandFlag::GetPaymentAddress => FishCommand::GetPaymentAddress,
+                FishCommandFlag::GetFishInfo => FishCommand::GetFishInfo,
+                FishCommandFlag::GetAgentLink => FishCommand::GetAgentLink,
                 FishCommandFlag::AdminQueryFish => {
                     let address = if let Some(address) = &cap.get(0) {
                         address.as_str().to_string()
                     } else {
-                        return Some(ParseFishCommandResult::Err(
-                            "请提供有效的地址".to_string(),
-                        ));
+                        return Some(ParseFishCommandResult::Err("请提供有效的地址".to_string()));
                     };
                     FishCommand::AdminQueryFish(address)
                 }
@@ -193,9 +188,7 @@ impl FishCommand {
                             }
                         }
                     } else {
-                        return Some(ParseFishCommandResult::Err(
-                            "请提供有效的金额".to_string(),
-                        ));
+                        return Some(ParseFishCommandResult::Err("请提供有效的金额".to_string()));
                     };
                     FishCommand::Payment(value)
                 }

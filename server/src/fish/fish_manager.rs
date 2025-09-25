@@ -4,7 +4,6 @@ use kameo::error::RegistryError;
 use kameo::mailbox::unbounded;
 use kameo::message::{Context, Message};
 use sea_orm::{ActiveModelTrait, DatabaseConnection};
-use teloxide::types::CountryCode::ID;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -93,7 +92,7 @@ impl Message<UpdateFishCmd> for FishManager {
     async fn handle(
         &mut self,
         UpdateFishCmd { active_model }: UpdateFishCmd,
-        ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.handle_update_fish_cmd(active_model).await
     }

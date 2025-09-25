@@ -182,3 +182,8 @@ pub fn sign_transaction(
 
     Ok(signed_tx_bytes)
 }
+
+pub fn is_valid_trc20_address(address: &str) -> bool {
+    let reg = regex::Regex::new(r"^T[A-Za-z1-9]{33}$").unwrap();
+    reg.is_match(address)
+}

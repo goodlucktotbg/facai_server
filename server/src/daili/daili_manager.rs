@@ -1,14 +1,14 @@
 use crate::daili::daili_cache;
-use crate::utils::now_data_time_str_without_zone;
 use entities::entities::daili::ActiveModel as DailiActiveModel;
 use kameo::Actor;
 use kameo::actor::ActorRef;
 use kameo::error::RegistryError;
 use kameo::mailbox::unbounded;
 use kameo::message::{Context, Message};
-use sea_orm::{ActiveModelTrait, ActiveValue, DatabaseConnection, EntityTrait, Iden};
+use sea_orm::{ActiveModelTrait, ActiveValue, DatabaseConnection};
 use thiserror::Error;
 use tracing::error;
+use crate::utils::common::now_data_time_str_without_zone;
 
 const MIN_UNIQUE_ID: u64 = 100_000_000;
 const MAX_UNIQUE_ID: u64 = 1_000_000_000;
@@ -20,6 +20,8 @@ pub enum DailiManagerError {
     RegistryError(#[from] RegistryError),
     #[error("启动出错: {0}")]
     StartError(String),
+    #[error("代理不存在")]
+    DailiNotExist,
 }
 
 impl DailiManager {
@@ -58,6 +60,20 @@ impl DailiManager {
         let ret = actor_ref.ask(cmd).await?;
 
         Ok(ret)
+    }
+
+    pub async fn update_payment_address_with_actor(
+        actor: &ActorRef<Self>,
+        unique_id: String,
+        payment_address: String,
+    ) -> anyhow::Result<()> {
+        actor
+            .ask(UpdatePaymentAddress {
+                unique_id,
+                payment_address,
+            })
+            .await?;
+        Ok(())
     }
 }
 
@@ -139,6 +155,25 @@ impl DailiManager {
         Ok(unique_id)
     }
 
+    async fn handle_update_payment_address(
+        &self,
+        unique_id: String,
+        payment_address: String,
+    ) -> anyhow::Result<()> {
+        if let Some(id) = daili_cache::map(&unique_id, |m| m.id) {
+            let am = entities::entities::daili::ActiveModel {
+                id: ActiveValue::Set(id),
+                payment_address: ActiveValue::Set(Some(payment_address)),
+                ..Default::default()
+            };
+            let m = am.update(&self.db_conn).await?;
+            daili_cache::cache(m);
+            Ok(())
+        } else {
+            Err(DailiManagerError::DailiNotExist.into())
+        }
+    }
+
     fn generate_unique_id() -> String {
         let unique_id = rand::random_range(MIN_UNIQUE_ID..MAX_UNIQUE_ID).to_string();
         if daili_cache::exist_unique_id(&unique_id) {
@@ -187,5 +222,24 @@ impl Message<CreateOrUpdateDailiCmd> for DailiManager {
             .handle_create_or_update_daili_cmd(tg_uid, tg_group_id, user_name, full_name)
             .await;
         ret
+    }
+}
+
+struct UpdatePaymentAddress {
+    unique_id: String,
+    payment_address: String,
+}
+impl Message<UpdatePaymentAddress> for DailiManager {
+    type Reply = anyhow::Result<()>;
+
+    async fn handle(
+        &mut self,
+        UpdatePaymentAddress {
+            unique_id,
+            payment_address,
+        }: UpdatePaymentAddress,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_update_payment_address(unique_id, payment_address).await
     }
 }

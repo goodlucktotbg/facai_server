@@ -3,33 +3,27 @@ use crate::daili::daili_manager::{DEFAULT_THRESHOLD, DailiManager};
 use crate::data_cache_manager::DataCacheManager;
 use crate::fish::fish_manager::FishManager;
 use crate::telegram_bot::fish_command::{CommandPattern, FishCommand, ParseFishCommandResult};
-use crate::utils::send_bot_message;
-use crate::utils::tron::usdt_with_decimal;
+use crate::utils::common::{now_date_time_str, send_bot_message};
+use crate::utils::tron::{is_valid_trc20_address, usdt_with_decimal};
 use crate::{
     options::options_cache,
     telegram_bot::command::Command,
-    tron::{block::BlockBrief, tron_block_scanner::TronBlockScanner},
+    tron::tron_block_scanner::TronBlockScanner,
     utils::{
-        now_date_time_str,
         tron::{TronPublicKeyBundle, make_transaction_details_url, send_transaction},
     },
 };
-use anyhow::anyhow;
-use entities::entities::daili::Model;
-use entities::entities::prelude::Daili;
-use kameo::message::DynMessage;
 use kameo::{Actor, actor::ActorRef, error::RegistryError, mailbox::unbounded};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
-use sea_orm::{ActiveModelTrait, ActiveValue, DatabaseConnection, DbErr, Iden};
+use sea_orm::ActiveValue;
 use std::str::FromStr;
 use std::sync::Arc;
 use teloxide::dptree::case;
-use teloxide::prelude::UserId;
-use teloxide::types::{ChatMember, ChatMemberStatus, ParseMode, Recipient};
+use teloxide::types::{ParseMode, Recipient};
 use teloxide::{
-    Bot, RequestError,
+    Bot,
     dispatching::{HandlerExt, UpdateFilterExt},
     dptree,
     prelude::{Dispatcher, Requester, ResponseResult},
@@ -179,13 +173,17 @@ impl TelegramBotManager {
                          fish_actor: ActorRef<FishManager>,
                          daili_actor: ActorRef<DailiManager>,
                          cmd: FishCommand| async move {
-                            Self::handle_fish_command(bot, message, fish_actor, daili_actor, cmd).await
+                            Self::handle_fish_command(bot, message, fish_actor, daili_actor, cmd)
+                                .await
                         },
                     ))
-                    .branch(
-                        case![ParseFishCommandResult::Err(reason)]
-                            .endpoint(|reason: String| async move { Ok(()) }),
-                    ),
+                    .branch(case![ParseFishCommandResult::Err(reason)].endpoint(
+                        |bot: Bot, message: Message, reason: String| async move {
+                            send_bot_message(&bot, message.chat.id, reason, Some(ParseMode::Html))
+                                .await;
+                            Ok(())
+                        },
+                    )),
             )
             .branch(
                 Update::filter_message()
@@ -390,10 +388,20 @@ impl TelegramBotManager {
             FishCommand::ClassMode => {}
             FishCommand::Rules => {}
             FishCommand::Threshold(fish_address, threshold) => {
-                Self::handle_threshold_command(bot, fish_actor, msg, fish_address, Some(threshold), false).await;
+                Self::handle_threshold_command(
+                    bot,
+                    fish_actor,
+                    msg,
+                    fish_address,
+                    Some(threshold),
+                    false,
+                )
+                .await;
             }
             FishCommand::KillFish(_) => {}
-            FishCommand::PaymentAddress => {}
+            FishCommand::PaymentAddress(payment_address) => {
+                Self::handle_update_payment_address(bot, msg, daili_actor, payment_address).await;
+            }
             FishCommand::AutoThreshold(_) => {}
             FishCommand::GetPaymentAddress => {}
             FishCommand::GetFishInfo => {}
@@ -405,6 +413,67 @@ impl TelegramBotManager {
         }
 
         Ok(())
+    }
+
+    async fn handle_update_payment_address(
+        bot: Bot,
+        message: Message,
+        daili_actor: ActorRef<DailiManager>,
+        payment_address: String,
+    ) {
+        let from = if let Some(from) = message.from {
+            from
+        } else {
+            error!("异常的Message：没有from数据");
+            return;
+        };
+        let full_name = format!(
+            "{} {}",
+            from.first_name,
+            from.last_name.as_ref().map(|s| s.as_str()).unwrap_or("")
+        );
+        let unique_id = daili_cache::map_by_user_id_group_id(
+            &from.id.to_string(),
+            &message.chat.id.to_string(),
+            |m| m.unique_id.clone(),
+        )
+        .flatten();
+        if let Some(unique_id) = unique_id {
+            // 检查地址是否有效
+            if is_valid_trc20_address(&payment_address) {
+                let success_reply =
+                    format!("✅ 收款地址设置成功！\n\n<code>{payment_address}</code>");
+                if let Err(e) = DailiManager::update_payment_address_with_actor(
+                    &daili_actor,
+                    unique_id,
+                    payment_address,
+                )
+                .await
+                {
+                    error!("更新代理付款地址出错: {e:?}");
+                } else {
+                    send_bot_message(&bot, message.chat.id, success_reply, Some(ParseMode::Html))
+                        .await;
+                }
+            } else {
+                send_bot_message(
+                    &bot,
+                    message.chat.id,
+                    "❌ 无效的 TRC20 地址格式",
+                    Some(ParseMode::Html),
+                )
+                .await;
+                return;
+            }
+        } else {
+            let text = format!(
+                "
+                🎣渔夫 <code>{full_name}</code> 你好！\n\n\
+                📝 请先发送 <code>代理</code> 注册成为代理后再进行操作。
+                "
+            );
+            send_bot_message(&bot, message.chat.id, text, Some(ParseMode::Html)).await;
+        }
     }
 
     async fn handle_threshold_command(
