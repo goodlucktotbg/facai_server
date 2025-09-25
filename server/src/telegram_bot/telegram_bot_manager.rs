@@ -1,6 +1,7 @@
 use crate::daili::daili_cache;
 use crate::daili::daili_manager::{DEFAULT_THRESHOLD, DailiManager};
 use crate::data_cache_manager::DataCacheManager;
+use crate::fish::fish_manager::FishManager;
 use crate::telegram_bot::fish_command::{CommandPattern, FishCommand, ParseFishCommandResult};
 use crate::utils::send_bot_message;
 use crate::utils::tron::usdt_with_decimal;
@@ -19,11 +20,11 @@ use entities::entities::prelude::Daili;
 use kameo::message::DynMessage;
 use kameo::{Actor, actor::ActorRef, error::RegistryError, mailbox::unbounded};
 use reqwest::Client;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 use sea_orm::{ActiveModelTrait, ActiveValue, DatabaseConnection, DbErr, Iden};
 use std::str::FromStr;
 use std::sync::Arc;
-use rust_decimal::Decimal;
-use rust_decimal::prelude::FromPrimitive;
 use teloxide::dptree::case;
 use teloxide::prelude::UserId;
 use teloxide::types::{ChatMember, ChatMemberStatus, ParseMode, Recipient};
@@ -144,10 +145,17 @@ impl TelegramBotManager {
             .await
             .map_err(|e| TelegramBotManagerError::DbConnError(format!("{:?}", e)))?;
         deps.insert(db_conn);
+
         let daili_manager = DailiManager::me().await?.ok_or_else(|| {
             TelegramBotManagerError::DependentServiceNotStart("DailiManager".to_string())
         })?;
         deps.insert(daili_manager);
+
+        let fish_manager = FishManager::me().await?.ok_or_else(|| {
+            TelegramBotManagerError::DependentServiceNotStart("FishManager".to_string())
+        })?;
+        deps.insert(fish_manager);
+
         let fish_command_patterns = Arc::new(super::fish_command::init_patterns());
         deps.insert(fish_command_patterns);
 
@@ -168,9 +176,10 @@ impl TelegramBotManager {
                     .branch(case![ParseFishCommandResult::Ok(cmd)].endpoint(
                         |bot: Bot,
                          message: Message,
+                         fish_actor: ActorRef<FishManager>,
                          daili_actor: ActorRef<DailiManager>,
                          cmd: FishCommand| async move {
-                            Self::handle_fish_command(bot, message, daili_actor, cmd).await
+                            Self::handle_fish_command(bot, message, fish_actor, daili_actor, cmd).await
                         },
                     ))
                     .branch(
@@ -373,6 +382,7 @@ impl TelegramBotManager {
     async fn handle_fish_command(
         bot: Bot,
         msg: Message,
+        fish_actor: ActorRef<FishManager>,
         daili_actor: ActorRef<DailiManager>,
         cmd: FishCommand,
     ) -> ResponseResult<()> {
@@ -380,7 +390,7 @@ impl TelegramBotManager {
             FishCommand::ClassMode => {}
             FishCommand::Rules => {}
             FishCommand::Threshold(fish_address, threshold) => {
-                Self::handle_threshold_command(bot, msg, fish_address, threshold).await;
+                Self::handle_threshold_command(bot, fish_actor, msg, fish_address, Some(threshold), false).await;
             }
             FishCommand::KillFish(_) => {}
             FishCommand::PaymentAddress => {}
@@ -399,7 +409,7 @@ impl TelegramBotManager {
 
     async fn handle_threshold_command(
         bot: Bot,
-        db_conn: DatabaseConnection,
+        fish_manager: ActorRef<FishManager>,
         msg: Message,
         fish_address: String,
         threshold: Option<f64>,
@@ -508,26 +518,26 @@ impl TelegramBotManager {
                     threshold: ActiveValue::Set(Some(threshold_with_decimal)),
                     ..Default::default()
                 };
-                let ret = am.update(&db_conn).await;
-                match ret {
-                    Ok(m) => {
-                        crate::fish::fish_cache::cache(m);
-                    }
-                    Err(e) => {
-                        let text = if is_kill {
-                            error!("杀鱼时出错错误: {e:?}");
-                            "❌ 杀鱼时出现错误，请联系管理"
-                        } else {
-                            error!("修改阈值时出错错误: {e:?}");
-                            "❌ 修改阈值时出现错误，请联系管理"
-                        };
-                        send_bot_message(&bot, msg.chat.id, text, Some(ParseMode::Html)).await;
-
-                    }
+                // let ret = am.update(&db_conn).await;
+                if let Err(e) = FishManager::update_fish_with_actor(&fish_manager, am).await {
+                    let text = if is_kill {
+                        error!("杀鱼时出错错误: {e:?}");
+                        "❌ 杀鱼时出现错误，请联系管理"
+                    } else {
+                        error!("修改阈值时出错错误: {e:?}");
+                        "❌ 修改阈值时出现错误，请联系管理"
+                    };
+                    send_bot_message(&bot, msg.chat.id, text, Some(ParseMode::Html)).await;
                 }
             } else {
                 error!("修改阈值出现错误：{threshold}无法转换为Decimal");
-                send_bot_message(&bot, msg.chat.id, "❌ 修改阈值时出现错误: 阈值不是一个有效值，请进行检查", Some(ParseMode::Html)).await;
+                send_bot_message(
+                    &bot,
+                    msg.chat.id,
+                    "❌ 修改阈值时出现错误: 阈值不是一个有效值，请进行检查",
+                    Some(ParseMode::Html),
+                )
+                .await;
             }
         }
     }

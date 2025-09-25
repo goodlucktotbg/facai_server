@@ -7,6 +7,7 @@ use crate::{
     telegram_bot::telegram_bot_manager::TelegramBotManager, tron::tron_manager::TronManager,
 };
 use crate::daili::daili_manager::DailiManager;
+use crate::fish::fish_manager::FishManager;
 
 #[derive(Debug, Error, Clone)]
 pub enum ApplicationError {
@@ -55,6 +56,10 @@ impl Actor for Application {
 
         DailiManager::spawn_link(&actor_ref).await.map_err(|e| {
             ApplicationError::StartServiceError("daili manager".to_string(), format!("{e:?}"))
+        })?;
+
+        FishManager::spawn_link(&actor_ref).await.map_err(|e| {
+            ApplicationError::StartServiceError("fish manager".to_string(), format!("{e:?}"))
         })?;
 
         let bot = TelegramBotManager::init_bot().map_err(|e| {
