@@ -20,6 +20,10 @@ pub(crate) fn default_unique_id() -> Option<String> {
         .flatten()
 }
 
+pub(crate) fn main_domain() -> Option<String> {
+    map("main_domain", |m|m.value.clone()).flatten()
+}
+
 pub(crate) fn tron_grid_keys() -> Vec<String> {
     TRON_GRID_KEYS.read().clone()
 }

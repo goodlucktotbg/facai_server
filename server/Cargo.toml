@@ -39,3 +39,4 @@ once_cell.workspace = true
 dashmap.workspace = true
 ethabi.workspace = true
 bs58.workspace = true
+regex = "1.11.2"

